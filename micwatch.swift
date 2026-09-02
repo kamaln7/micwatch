@@ -121,6 +121,22 @@ func appsOnMic() -> [String] {
     }
 }
 
+/// Watched apps that are running, mic or not — see Config.defaultApps.
+func watchedAppsRunning(_ config: Config?) -> [String] {
+    let watched = Set(config?.watchedApps ?? Config.defaultApps)
+    guard !watched.isEmpty else { return [] }
+    return NSWorkspace.shared.runningApplications.compactMap { app in
+        guard let id = app.bundleIdentifier, watched.contains(id) else { return nil }
+        return app.localizedName ?? id
+    }
+}
+
+/// Everything that counts as a meeting right now. Empty = no meeting.
+func meetingApps() -> [String] {
+    var seen = Set<String>()
+    return (appsOnMic() + watchedAppsRunning(Config.load())).filter { seen.insert($0).inserted }
+}
+
 // MARK: - Home Assistant
 
 /// ~/.config/micwatch.json — non-secret settings only.
@@ -128,9 +144,32 @@ func appsOnMic() -> [String] {
 struct Config: Codable, Equatable {
     var url: String        // e.g. "http://homeassistant.local:8123"
     var entity: String     // e.g. "media_player.kitchen"
-    var entityName: String?        // friendly_name, so the UI needn't derive one
+    var entityName: String?        // legacy single-player friendly_name
+    var players: [String]?         // several players; `entity` stays the first for old readers
+    var playerNames: [String: String]?   // friendly_name per player, so the UI needn't derive one
     var homeRouter: String?        // gateway MAC of the home network
     var requireHomeNetwork: Bool?  // optional: older config files predate both
+    var apps: [String]?            // bundle ids that count as a meeting while merely running
+    var eventsEnabled: Bool?       // fire an HA event when a meeting starts or ends
+    var eventName: String?         // its event_type, default "micwatch"
+    var eventData: [String: String]?   // extra keys merged into every event's payload
+
+    /// Zoom only opens the mic once you've joined, seconds after the window is
+    /// up — so it alone is treated as a meeting from the moment it launches.
+    static let defaultApps = ["us.zoom.xos"]
+    /// Call-only apps. Slack, Teams and Discord are open all day for chat, so
+    /// merely running says nothing.
+    static let knownApps: [(name: String, id: String)] = [
+        ("Zoom", "us.zoom.xos"), ("Webex", "Cisco-Systems.Spark"), ("FaceTime", "com.apple.FaceTime"),
+    ]
+    var watchedApps: [String] { apps ?? Config.defaultApps }
+    var playerList: [String] { players ?? (entity.isEmpty ? [] : [entity]) }
+    func name(of player: String) -> String { playerNames?[player] ?? entityName ?? player }
+    var displayName: String { playerList.map(name(of:)).joined(separator: ", ") }
+    var resolvedEventName: String {
+        let name = (eventName ?? "").trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? "micwatch" : name
+    }
 
     static let path = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/micwatch.json")
@@ -215,6 +254,75 @@ func haRequest(_ path: String, method: String = "GET", body: Data? = nil) -> (st
     return haRequest(path, base: config.url, token: token, method: method, body: body)
 }
 
+/// `key=value` lines; blank lines and lines without `=` are ignored. nil when
+/// there's nothing, so the config file doesn't grow an empty object.
+func parseKeyValues(_ text: String) -> [String: String]? {
+    let pairs = text.split(separator: "\n").compactMap { line -> (String, String)? in
+        guard let eq = line.firstIndex(of: "=") else { return nil }
+        let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+        return key.isEmpty ? nil : (key, line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces))
+    }
+    return pairs.isEmpty ? nil : Dictionary(pairs, uniquingKeysWith: { _, last in last })
+}
+
+/// Whether the token's user may fire events, which Home Assistant reserves for
+/// admins. Asked over the WebSocket API: auth/current_user is open to any user,
+/// and unlike an admin-only REST probe a "no" here doesn't go through the ban
+/// middleware — which turns every 401 into an "invalid authentication"
+/// notification on the dashboard.
+func tokenIsAdmin(base: String, token: String) async -> Bool? {
+    guard var parts = URLComponents(string: base + "/api/websocket") else { return nil }
+    parts.scheme = parts.scheme == "https" ? "wss" : "ws"
+    guard let url = parts.url else { return nil }
+    let socket = URLSession.shared.webSocketTask(with: url)
+    socket.resume()
+    defer { socket.cancel(with: .goingAway, reason: nil) }
+
+    func receive() async -> [String: Any]? {
+        guard case .string(let text)? = try? await socket.receive(),
+              let data = text.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+    func send(_ object: [String: Any]) async -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: object),
+              let text = String(data: data, encoding: .utf8) else { return false }
+        return (try? await socket.send(.string(text))) != nil
+    }
+
+    guard await receive()?["type"] as? String == "auth_required",
+          await send(["type": "auth", "access_token": token]),
+          await receive()?["type"] as? String == "auth_ok",
+          await send(["id": 1, "type": "auth/current_user"]),
+          let reply = await receive(), reply["success"] as? Bool == true,
+          let user = reply["result"] as? [String: Any] else { return nil }
+    return user["is_admin"] as? Bool
+}
+
+/// One event type with a `status` key, rather than two event types: an
+/// automation can then trigger on either transition, or filter on one with
+/// event_data, without the user having to name both events.
+func eventPayload(_ config: Config, status: String, apps: [String], mic: Bool) -> [String: Any] {
+    var payload: [String: Any] = config.eventData ?? [:]
+    payload["status"] = status              // "started" | "ended" | "test"
+    payload["apps"] = apps
+    payload["mic"] = mic                    // false when it's only a watched app running
+    payload["players"] = config.playerList
+    payload["host"] = ProcessInfo.processInfo.hostName
+    return payload
+}
+
+func emitEvent(status: String, apps: [String], mic: Bool, done: ((Int) -> Void)? = nil) {
+    guard let config = Config.load(), config.eventsEnabled == true, loadToken() != nil else { return }
+    let payload = eventPayload(config, status: status, apps: apps, mic: mic)
+    let name = config.resolvedEventName
+    DispatchQueue.global(qos: .utility).async {
+        let body = try? JSONSerialization.data(withJSONObject: payload)
+        let code = haRequest("/api/events/\(name)", method: "POST", body: body)?.status ?? 0
+        print(code == 200 ? "  event \(name) status=\(status)" : "  could not send event \(name) (HTTP \(code))")
+        if let done { DispatchQueue.main.async { done(code) } }
+    }
+}
+
 /// Prints the configured entity's state, so you can confirm auth and entity id
 /// before anything depends on them.
 func haState() -> Never {
@@ -231,25 +339,32 @@ func haState() -> Never {
         """)
         exit(1)
     }
-    guard let (status, data) = haRequest("/api/states/\(config.entity)") else {
-        print("FAIL: no response from \(config.url) — is it reachable from here?")
-        exit(1)
-    }
-    guard status == 200 else {
-        let hint = status == 401 ? "  (token rejected)" : status == 404 ? "  (no such entity)" : ""
-        print("FAIL: HTTP \(status)\(hint)\n\(String(data: data, encoding: .utf8) ?? "")")
-        exit(1)
-    }
-    let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-    let state = json["state"] as? String ?? "?"
-    let attrs = json["attributes"] as? [String: Any] ?? [:]
     print("gateway: \(gatewayMAC() ?? "unknown")  home gate: " +
           (config.requireHomeNetwork == true
            ? (onHomeNetwork(config) ? "on, at home" : "on, away — would not pause")
            : "off"))
-    print("\(config.entity): \(state)")
-    for key in ["media_title", "media_artist", "volume_level", "friendly_name"] {
-        if let value = attrs[key] { print("  \(key): \(value)") }
+    let done = DispatchSemaphore(value: 0)
+    var admin: Bool?
+    Task { admin = await tokenIsAdmin(base: config.url, token: loadToken() ?? ""); done.signal() }
+    done.wait()
+    print("events: " + (admin.map { $0 ? "token is admin, can fire" : "token is NOT admin — HA will refuse" }
+                        ?? "could not check (websocket)"))
+    for player in config.playerList {
+        guard let (status, data) = haRequest("/api/states/\(player)") else {
+            print("FAIL: no response from \(config.url) — is it reachable from here?")
+            exit(1)
+        }
+        guard status == 200 else {
+            let hint = status == 401 ? "  (token rejected)" : status == 404 ? "  (no such entity)" : ""
+            print("FAIL: HTTP \(status)\(hint)\n\(String(data: data, encoding: .utf8) ?? "")")
+            exit(1)
+        }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let attrs = json["attributes"] as? [String: Any] ?? [:]
+        print("\(player): \(json["state"] as? String ?? "?")")
+        for key in ["media_title", "media_artist", "volume_level", "friendly_name"] {
+            if let value = attrs[key] { print("  \(key): \(value)") }
+        }
     }
     exit(0)
 }
@@ -296,11 +411,11 @@ func onHomeNetwork(_ config: Config) -> Bool {
 
 // MARK: - Pause control
 
-/// Pauses the configured player when a meeting starts, and resumes it afterwards.
+/// Pauses the configured players when a meeting starts, and resumes them afterwards.
 final class MusicControl {
-    /// Resume only what we paused. If it was already paused, or you paused it
-    /// yourself mid-meeting, the meeting ending shouldn't start it playing.
-    private var pausedByUs = false
+    /// Resume only what we paused. If a player was already paused, or you paused
+    /// it yourself mid-meeting, the meeting ending shouldn't start it playing.
+    private var paused = Set<String>()
     private let queue = DispatchQueue(label: "micwatch.ha")
 
     /// Called on the main thread whenever we pause or resume, so the menu bar
@@ -313,79 +428,84 @@ final class MusicControl {
     }
 
     private func apply(_ active: Bool, _ allowed: Bool) {
-        guard let config = Config.load(), !config.entity.isEmpty, loadToken() != nil else { return }
+        guard let config = Config.load(), !config.playerList.isEmpty, loadToken() != nil else { return }
         if active {
-            guard !pausedByUs, allowed else { return }
+            guard paused.isEmpty, allowed else { return }
             guard onHomeNetwork(config) else {
                 print("  not on the home network (gateway \(gatewayMAC() ?? "unknown")) — leaving it alone")
                 return
             }
-            let state = playerState(config)
-            guard state == "playing" else {
-                print("  \(config.entity) is \(state ?? "unreachable") — leaving it alone")
-                return
+            for player in config.playerList {
+                let state = playerState(player, config)
+                guard state == "playing" else {
+                    print("  \(player) is \(state ?? "unreachable") — leaving it alone")
+                    continue
+                }
+                if call("media_pause", player) {
+                    paused.insert(player)
+                    print("  paused \(player)")
+                }
             }
-            if call("media_pause", config) {
-                pausedByUs = true
-                print("  paused \(config.entity)")
-                DispatchQueue.main.async { self.onPausedChange?(true) }
-            }
-        } else if pausedByUs {
-            pausedByUs = false
-            print(call("media_play", config) ? "  resumed \(config.entity)" : "  could not resume \(config.entity)")
-            DispatchQueue.main.async { self.onPausedChange?(false) }
+            if !paused.isEmpty { DispatchQueue.main.async { self.onPausedChange?(true) } }
+        } else if !paused.isEmpty {
+            resumeAll()
         }
     }
 
+    private func resumeAll(_ why: String = "") {
+        for player in paused {
+            print(call("media_play", player) ? "  resumed \(player)\(why)" : "  could not resume \(player)")
+        }
+        paused = []
+        DispatchQueue.main.async { self.onPausedChange?(false) }
+    }
+
     /// Pause again after resuming by hand. Same guards as an automatic
-    /// pause: it only acts if the player is actually playing.
+    /// pause: it only acts on players that are actually playing.
     func pauseNow() {
         queue.async { self.apply(true, true) }
     }
 
     /// Resume immediately, while the mic is still held. The meeting ending later won't touch it
-    /// again, because we're no longer holding it paused.
+    /// again, because we're no longer holding anything paused.
     func resumeNow() {
         queue.async {
-            guard self.pausedByUs, let config = Config.load() else { return }
-            self.pausedByUs = false
-            print(self.call("media_play", config) ? "  resumed \(config.entity) on request"
-                                                  : "  could not resume \(config.entity)")
-            DispatchQueue.main.async { self.onPausedChange?(false) }
+            guard !self.paused.isEmpty else { return }
+            self.resumeAll(" on request")
         }
     }
 
-    /// Let go without resuming: the speaker stays paused and micwatch forgets it
-    /// ever touched it, so nothing starts playing later on its own.
+    /// Let go without resuming: the speakers stay paused and micwatch forgets it
+    /// ever touched them, so nothing starts playing later on its own.
     func abandon() {
         queue.async {
-            guard self.pausedByUs else { return }
-            self.pausedByUs = false
+            guard !self.paused.isEmpty else { return }
+            self.paused = []
             print("  leaving it paused")
             DispatchQueue.main.async { self.onPausedChange?(false) }
         }
     }
 
-    private func playerState(_ config: Config) -> String? {
-        guard let (status, data) = haRequest("/api/states/\(config.entity)"), status == 200,
+    private func playerState(_ player: String, _ config: Config) -> String? {
+        guard let (status, data) = haRequest("/api/states/\(player)"), status == 200,
               let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
-        rememberName(from: json, config)
+        rememberName(from: json, player, config)
         return json["state"] as? String
     }
 
-    /// Keep the stored display name current. Backfills configs written before
+    /// Keep the stored display names current. Backfills configs written before
     /// names were stored, and follows a rename in Home Assistant without asking
     /// you to re-pick the player. Config.save writes nothing if it matches.
-    private func rememberName(from json: [String: Any], _ config: Config) {
+    private func rememberName(from json: [String: Any], _ player: String, _ config: Config) {
         guard let name = (json["attributes"] as? [String: Any])?["friendly_name"] as? String,
-              !name.isEmpty, name != config.entityName else { return }
+              !name.isEmpty, name != config.playerNames?[player] else { return }
         var updated = config
-        updated.entityName = name
+        updated.playerNames = (config.playerNames ?? [:]).merging([player: name]) { _, new in new }
         try? updated.save()
     }
 
-    private func call(_ service: String, _ config: Config) -> Bool {
-        let body = try? JSONSerialization.data(withJSONObject: ["entity_id": config.entity])
+    private func call(_ service: String, _ player: String) -> Bool {
+        let body = try? JSONSerialization.data(withJSONObject: ["entity_id": player])
         guard let (status, _) = haRequest("/api/services/media_player/\(service)",
                                           method: "POST", body: body) else { return false }
         return status == 200
@@ -399,6 +519,17 @@ struct EntityOption: Identifiable, Hashable {
     let name: String            // friendly_name, falling back to the id
     let deviceClass: String?    // "speaker", "tv", …
     let grouped: Bool           // part of a multi-speaker group
+    let playing: Bool           // at the time the list was loaded
+
+    /// Speakers, then receivers, then televisions, then the rest.
+    var typeRank: Int {
+        switch deviceClass {
+        case "speaker":  return 0
+        case "receiver": return 1
+        case "tv":       return 2
+        default:         return 3
+        }
+    }
 
     /// Enough to tell a speaker from the television at a glance.
     var symbol: String {
@@ -420,6 +551,12 @@ final class SettingsModel: ObservableObject {
     @Published var saved = false
     @Published var requireHome = false
     @Published var homeRouter = ""
+    @Published var apps = Set(Config.defaultApps)
+    @Published var eventsEnabled = false
+    @Published var eventName = ""
+    /// One `key=value` per line; parsed on save. Cheaper than a row editor and
+    /// just as clear for the handful of keys anyone attaches.
+    @Published var eventData = ""
     /// Filled in by refreshRouter, never in the initializer: reading it spawns
     /// subprocesses, and doing that while SwiftUI builds the view re-enters
     /// layout and trips an AttributeGraph precondition.
@@ -429,7 +566,9 @@ final class SettingsModel: ObservableObject {
     @Published var url = ""   // empty, so first launch shows no state rather than a failure
     @Published var token = ""
     @Published var entities: [EntityOption] = []
-    @Published var selected = ""
+    @Published var selected = Set<String>()
+    @Published var testResult = ""
+    @Published var canFireEvents: Bool?     // nil until checked
     @Published var status = ""
     @Published var failed = false
     @Published var busy = false
@@ -442,12 +581,7 @@ final class SettingsModel: ObservableObject {
     }
 
     init() {
-        if let config = Config.load() {
-            url = config.url
-            selected = config.entity
-            homeRouter = config.homeRouter ?? ""
-            requireHome = config.requireHomeNetwork == true
-        }
+        if let config = Config.load() { apply(config) }
         if let saved = loadToken() { token = saved }
 
         observer = NotificationCenter.default.addObserver(
@@ -514,20 +648,24 @@ final class SettingsModel: ObservableObject {
                 return EntityOption(id: id,
                                     name: attributes?["friendly_name"] as? String ?? id,
                                     deviceClass: attributes?["device_class"] as? String,
-                                    grouped: members.count > 1)
-            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                                    grouped: members.count > 1,
+                                    playing: entity["state"] as? String == "playing")
+            }.sorted {
+                $0.typeRank != $1.typeRank ? $0.typeRank < $1.typeRank
+                    : $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
 
             guard !entities.isEmpty else {
                 fail("Connected, but no media players found")
                 return
             }
-            if !entities.contains(where: { $0.id == selected }) {
-                selected = entities[0].id
-            }
+            selected.formIntersection(entities.map(\.id))
+            if selected.isEmpty { selected = [entities[0].id] }
             failed = false
             status = "Found \(entities.count) media players"
             saveToken(token)     // proven to work, so keep it
             persist()
+            canFireEvents = await tokenIsAdmin(base: base, token: token)
         } catch {
             fail("No response — is \(base) reachable from this Mac?")
         }
@@ -539,10 +677,75 @@ final class SettingsModel: ObservableObject {
     /// inactive app and that's exactly the case here.
     private func reloadFromDisk() {
         guard !NSApp.isActive, let config = Config.load() else { return }
+        apply(config)
+    }
+
+    private func apply(_ config: Config) {
         url = config.url
-        selected = config.entity
+        selected = Set(config.playerList)
         homeRouter = config.homeRouter ?? ""
         requireHome = config.requireHomeNetwork == true
+        apps = Set(config.watchedApps)
+        eventsEnabled = config.eventsEnabled == true
+        eventName = config.eventName ?? ""
+        eventData = (config.eventData ?? [:]).sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
+    }
+
+    /// Presets first, then anything hand-added to the config file, so an
+    /// unlisted app still shows up as a toggle rather than silently applying.
+    var appRows: [(name: String, id: String)] {
+        let known = Config.knownApps
+        let custom = apps.subtracting(known.map(\.id)).sorted().map { (name: $0, id: $0) }
+        return known + custom
+    }
+
+    func setApp(_ id: String, _ on: Bool) {
+        if on { apps.insert(id) } else { apps.remove(id) }
+        persist()
+    }
+
+    private var parsedEventData: [String: String]? { parseKeyValues(eventData) }
+
+    /// What HA will actually receive, keys in payload order, extras first as
+    /// they're merged first.
+    /// Hand-laid rather than serialised, so each field can carry a comment.
+    /// Mirrors eventPayload; keep the two together.
+    var examplePayload: String {
+        func q(_ v: String) -> String { "\"" + v.replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
+        var rows: [(String, String)] = [
+            ("\"status\": \"started\",", "started | ended | test"),
+            ("\"apps\": [\"Zoom\"],", "apps holding the mic, or always-on apps running"),
+            ("\"mic\": true,", "false when only an always-on app is running"),
+            ("\"players\": [\(orderedPlayers.map(q).joined(separator: ", "))],", "the players micwatch pauses"),
+            ("\"host\": \(q(ProcessInfo.processInfo.hostName)),", "this Mac"),
+        ]
+        rows += (parsedEventData ?? [:]).sorted { $0.key < $1.key }
+            .map { ("\(q($0.key)): \(q($0.value)),", "yours, from Extra data") }
+        rows[rows.count - 1].0.removeLast()      // no trailing comma on the last field
+        return "{\n" + rows.map { "  \($0.0) // \($0.1)" }.joined(separator: "\n") + "\n}"
+    }
+
+    /// Selection in the order Home Assistant lists them, so the config is stable.
+    private var orderedPlayers: [String] {
+        entities.isEmpty ? selected.sorted() : entities.map(\.id).filter(selected.contains)
+    }
+
+    func setPlayer(_ id: String, _ on: Bool) {
+        if on { selected.insert(id) } else { selected.remove(id) }
+        persist()
+    }
+
+    /// Fires a real event with the current settings, so the automation can be
+    /// built against something.
+    func sendTest() {
+        persist()
+        testResult = "Sending…"
+        emitEvent(status: "test", apps: meetingApps(), mic: !appsOnMic().isEmpty) { [weak self] code in
+            self?.testResult = code == 200 ? "Sent"
+                : code == 401 ? "Rejected: only an admin user's token can fire events"
+                : "Failed (HTTP \(code))"
+        }
     }
 
     /// Connect straight away when the settings are already filled in, so the
@@ -569,6 +772,9 @@ final class SettingsModel: ObservableObject {
         persist()
     }
 
+    /// Enough on file to show a summary instead of the form.
+    var connected: Bool { !url.isEmpty && !token.isEmpty }
+
     var onHomeNow: Bool {
         !homeRouter.isEmpty &&
             homeRouter.caseInsensitiveCompare(currentRouter) == .orderedSame
@@ -586,11 +792,19 @@ final class SettingsModel: ObservableObject {
         let base = url.trimmingCharacters(in: .whitespaces)
         guard !base.isEmpty else { return }
         do {
-            try Config(url: base, entity: selected,
-                       entityName: entities.first { $0.id == selected }?.name
-                           ?? Config.load()?.entityName,
+            let players = orderedPlayers
+            let known = Dictionary(uniqueKeysWithValues: entities.map { ($0.id, $0.name) })
+            let names = (Config.load()?.playerNames ?? [:]).merging(known) { _, new in new }
+                .filter { players.contains($0.key) }
+            try Config(url: base, entity: players.first ?? "",
+                       players: players,
+                       playerNames: names.isEmpty ? nil : names,
                        homeRouter: homeRouter.isEmpty ? nil : homeRouter,
-                       requireHomeNetwork: requireHome).save()
+                       requireHomeNetwork: requireHome,
+                       apps: apps.sorted(),
+                       eventsEnabled: eventsEnabled,
+                       eventName: eventName.isEmpty ? nil : eventName,
+                       eventData: parsedEventData).save()
             saved = true
         } catch {
             fail("Could not write \(Config.path.path)")
@@ -600,13 +814,291 @@ final class SettingsModel: ObservableObject {
 
 struct SettingsView: View {
     @StateObject private var model = SettingsModel()
+    @State private var showHA = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Home Assistant").font(.headline)
+        VStack(alignment: .leading, spacing: 20) {
+            section("Connection", "Your Home Assistant server", trailing: { haButtons }) {
+                if showHA || !model.connected { haEditor } else { haSummary }
+            }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Server URL").font(.caption).foregroundStyle(.secondary)
+            section("Pausing", "What to pause while the mic is in use, and when") {
+                labelled("Players") {
+                    if model.entities.isEmpty {
+                        Text(model.selected.isEmpty ? "Connect to load players"
+                                                    : model.selected.sorted().joined(separator: ", "))
+                            .font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        LazyVGrid(columns: Self.twoColumns, alignment: .leading, spacing: 6) {
+                            ForEach(model.entities) { entity in
+                                Toggle(isOn: Binding(
+                                    get: { model.selected.contains(entity.id) },
+                                    set: { model.setPlayer(entity.id, $0) })) {
+                                    HStack(spacing: 6) {
+                                        // Fixed slot: the symbols differ in width, and the
+                                        // names should still start in one column
+                                        Image(systemName: entity.symbol)
+                                            .foregroundStyle(entity.playing ? Color.green : Color.secondary)
+                                            .frame(width: 18)
+                                        Text(entity.name).lineLimit(1)
+                                    }
+                                }
+                                .help(entity.playing ? "\(entity.id) — playing now" : entity.id)
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                Toggle("Only when I'm on my home network", isOn: $model.requireHome)
+                    .onChange(of: model.requireHome) { model.persist() }
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        TextField("aa:bb:cc:dd:ee:ff", text: $model.homeRouter)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                            .onChange(of: model.homeRouter) { model.persist() }
+                            .onSubmit { model.persist() }
+                        if !model.onHomeNow {
+                            Button("Use current") {
+                                Task { await model.captureRouter() }
+                            }
+                        }
+                    }
+                    HStack(spacing: 6) {
+                        if model.homeRouter.isEmpty {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            Text("No router set — nothing will pause")
+                                .font(.caption).foregroundStyle(.orange)
+                        } else {
+                            Image(systemName: model.onHomeNow ? "house.fill" : "airplane")
+                                .foregroundStyle(model.onHomeNow ? Color.green : Color.secondary)
+                            Text(model.onHomeNow ? "You're on this network now" : "Not on this network right now")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(model.currentRouter.isEmpty ? "no router found" : "currently \(model.currentRouter)")
+                            .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
+                    }
+                }
+                .disabled(!model.requireHome)
+            }
+
+            section("Always-on apps", "On top of watching the mic: these count as a meeting from the moment they launch") {
+                LazyVGrid(columns: Self.threeColumns, alignment: .leading, spacing: 6) {
+                    ForEach(model.appRows, id: \.id) { row in
+                        Toggle(row.name, isOn: Binding(
+                            get: { model.apps.contains(row.id) },
+                            set: { model.setApp(row.id, $0) }))
+                    }
+                }
+                hint("For apps that open the mic only after you've joined — Zoom takes a few "
+                     + "seconds. Add others by bundle id in the config file.")
+            }
+
+            section("Custom automation", "Drive your own Home Assistant automations from meeting start and end",
+                    trailing: { eventsButton }) {
+                if model.canFireEvents == false {
+                    Label("Current token is missing admin privileges and cannot trigger events.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                if !model.eventsEnabled {
+                    Toggle("Send an event when a meeting starts or ends", isOn: $model.eventsEnabled)
+                        .onChange(of: model.eventsEnabled) { model.persist() }
+                } else {
+                    labelled("Event type") {
+                        TextField("micwatch", text: $model.eventName)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                            .onChange(of: model.eventName) { model.persist() }
+                    }
+                    labelled("Extra data, one key=value per line") {
+                        TextEditor(text: $model.eventData)
+                            .font(.system(.body, design: .monospaced))
+                            .frame(height: 54)
+                            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(.separator))
+                            .onChange(of: model.eventData) { model.persist() }
+                    }
+                    labelled("Example") {
+                        Text(highlightJSON(model.examplePayload))
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 5))
+                    }
+                }
+            }
+
+            // Always present, so saving doesn't change the window's height
+            Button(action: openConfigInEditor) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(model.saved ? "Saved to \(Config.path.path)" : " ")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if model.saved {
+                        Text("↗").font(.caption).foregroundStyle(Color.accentColor)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())     // the whole line, not just the glyph
+            }
+            .buttonStyle(.plain)
+            .disabled(!model.saved)
+            .help("Open in TextEdit")
+        }
+        .padding(18)
+        .frame(width: 480)
+        .task {
+            await model.refreshRouter()
+            await model.connectIfReady()
+        }
+        .task(id: model.url) {
+            try? await Task.sleep(nanoseconds: 600_000_000)   // debounce typing
+            guard !Task.isCancelled else { return }
+            await model.check()
+        }
+    }
+
+    // MARK: Layout
+
+    private static let twoColumns = Array(repeating: GridItem(.flexible(), alignment: .leading), count: 2)
+    private static let threeColumns = Array(repeating: GridItem(.flexible(), alignment: .leading), count: 3)
+
+    /// Title and one-line purpose above a grouped box — the same shape for every
+    /// section, so the page reads as a list rather than a form.
+    private func section<Trailing: View, Content: View>(
+        _ title: String, _ subtitle: String,
+        @ViewBuilder trailing: () -> Trailing,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title).font(.headline)
+                    Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
+                }
+                Spacer()
+                trailing()
+            }
+            GroupBox {
+                VStack(alignment: .leading, spacing: 10, content: content)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+            }
+        }
+    }
+
+    private func section<Content: View>(_ title: String, _ subtitle: String,
+                                        @ViewBuilder content: () -> Content) -> some View {
+        section(title, subtitle, trailing: { EmptyView() }, content: content)
+    }
+
+    private func labelled<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            content()
+        }
+    }
+
+    /// Keys, strings and literals in the system's own colours. Regex over
+    /// pretty-printed JSON we produced ourselves, so it needn't be a real parser.
+    private func highlightJSON(_ text: String) -> AttributedString {
+        var out = AttributedString(text)
+        out.foregroundColor = .secondary
+        let rules: [(String, Color)] = [
+            (#""[^"\n]*"(?=\s*:)"#, Color(nsColor: .systemPurple)),          // keys
+            (#"(?<=:\s)"[^"\n]*"|(?<=[\[,]\s)"[^"\n]*""#, Color(nsColor: .systemRed)),  // string values
+            (#"(?<=:\s)(true|false|null|-?\d+(\.\d+)?)"#, Color(nsColor: .systemBlue)),
+            (#"//.*$"#, Color(nsColor: .tertiaryLabelColor)),
+        ]
+        for (pattern, color) in rules {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: .anchorsMatchLines) else { continue }
+            for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                guard let range = Range(match.range, in: text),
+                      let lower = AttributedString.Index(range.lowerBound, within: out),
+                      let upper = AttributedString.Index(range.upperBound, within: out) else { continue }
+                out[lower..<upper].foregroundColor = color
+            }
+        }
+        return out
+    }
+
+    private func hint(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func bubble(_ text: String, mono: Bool = false, symbol: String? = nil) -> some View {
+        HStack(spacing: 3) {
+            if let symbol { Image(systemName: symbol).font(.caption) }
+            Text(text).font(mono ? .system(.callout, design: .monospaced) : .callout.weight(.medium))
+        }
+        .padding(.horizontal, 7).padding(.vertical, 2)
+        .background(.quaternary, in: Capsule())
+        .truncationMode(.middle)
+    }
+
+    // MARK: Home Assistant
+
+    /// Refresh re-reads the player list; the pencil opens the editor. Hidden
+    /// until there's a connection to summarise.
+    @ViewBuilder private var haButtons: some View {
+        if model.connected {
+            HStack(spacing: 10) {
+                Button { Task { await model.connect() } } label: { Image(systemName: "arrow.clockwise") }
+                    .help("Reconnect and refresh the player list")
+                    .disabled(model.busy)
+                Button { showHA.toggle() } label: { Image(systemName: showHA ? "chevron.up" : "pencil") }
+                    .help(showHA ? "Done" : "Edit Home Assistant details")
+            }
+            .buttonStyle(.borderless)
+        }
+    }
+
+    /// The toggle moves up here once it's on, so the box holds only the settings.
+    @ViewBuilder private var eventsButton: some View {
+        if model.eventsEnabled {
+            HStack(spacing: 8) {
+                if !model.testResult.isEmpty {
+                    Text(model.testResult).font(.caption)
+                        .foregroundStyle(model.testResult == "Sent" ? Color.secondary : Color.red)
+                }
+                Button("Test") { model.sendTest() }
+                    .help("Fire the event now, with status \"test\"")
+                Button("Turn off") {
+                    model.eventsEnabled = false
+                    model.persist()
+                }
+            }
+            .controlSize(.small)
+        }
+    }
+
+    /// One line once it's working: where, and what.
+    private var haSummary: some View {
+        HStack(spacing: 6) {
+            if model.busy {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: model.failed ? "xmark.circle.fill" : "checkmark.circle.fill")
+                    .foregroundStyle(model.failed ? Color.red : Color.green)
+            }
+            Text(model.failed ? "Could not connect to" : "Connected to")
+            bubble(model.url, mono: true)
+            Spacer(minLength: 0)
+        }
+        .font(.callout)
+        .lineLimit(1)
+        .help(model.failed ? model.status : "")
+    }
+
+    /// Everything needed to (re)connect. Shown until there's a URL and token,
+    /// and on request afterwards.
+    private var haEditor: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            labelled("Server URL") {
                 HStack(spacing: 8) {
                     TextField("http://homeassistant.local:8123", text: $model.url)
                         .textFieldStyle(.roundedBorder)
@@ -626,16 +1118,14 @@ struct SettingsView: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Long-lived access token").font(.caption).foregroundStyle(.secondary)
+            labelled("Long-lived access token") {
                 SecureField("Paste token", text: $model.token)
                     .textFieldStyle(.roundedBorder)
                 if let tokenPage = model.tokenPageURL {
                     Link("Create a token in Home Assistant →", destination: tokenPage)
                         .font(.caption)
                 }
-                Text("Scroll to Long-lived access tokens → Create Token. Stored in your Keychain.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                hint("Scroll to Long-lived access tokens → Create Token. Stored in ~/.config/micwatch-token.")
             }
 
             HStack(spacing: 10) {
@@ -648,93 +1138,6 @@ struct SettingsView: View {
                         .foregroundStyle(model.failed ? Color.red : Color.secondary)
                 }
             }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Pause this player when the mic is in use").font(.caption).foregroundStyle(.secondary)
-                Picker("", selection: $model.selected) {
-                    if model.entities.isEmpty {
-                        // Keep a tag matching the selection, or the Picker has nothing to show
-                        Text(model.selected.isEmpty ? "Connect to load players" : model.selected)
-                            .tag(model.selected)
-                    } else {
-                        ForEach(model.entities) { entity in
-                            Label(entity.name, systemImage: entity.symbol).tag(entity.id)
-                        }
-                    }
-                }
-                .labelsHidden()
-                .disabled(model.entities.isEmpty)
-                .onChange(of: model.selected) { model.persist() }
-                Text(model.selected.isEmpty ? "Nothing selected yet" : model.selected)
-                    .font(.caption).foregroundStyle(.tertiary)
-            }
-            Divider()
-
-            Toggle("Only pause when I'm on my home network", isOn: $model.requireHome)
-                .onChange(of: model.requireHome) { model.persist() }
-
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    TextField("aa:bb:cc:dd:ee:ff", text: $model.homeRouter)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
-                        .onChange(of: model.homeRouter) { model.persist() }
-                        .onSubmit { model.persist() }
-                    Button("Use current") {
-                        Task { await model.captureRouter() }
-                    }
-                }
-
-                HStack(spacing: 6) {
-                    if model.homeRouter.isEmpty {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                        Text("No router set — nothing will pause")
-                            .font(.caption).foregroundStyle(.orange)
-                    } else {
-                        Image(systemName: model.onHomeNow ? "house.fill" : "airplane")
-                            .foregroundStyle(model.onHomeNow ? Color.green : Color.secondary)
-                        Text(model.onHomeNow ? "You're on this network now" : "Not on this network right now")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text(model.currentRouter.isEmpty ? "no router found" : "currently \(model.currentRouter)")
-                        .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
-                }
-
-                Text("The router's MAC address identifies your network without needing location "
-                     + "permission. Type it in directly if you'd rather set it while away.")
-                    .font(.caption).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
-            }
-            .disabled(!model.requireHome)
-
-            // Always present, so saving doesn't change the window's height
-            Button(action: openConfigInEditor) {
-                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text(model.saved ? "Saved to \(Config.path.path)" : " ")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if model.saved {
-                        Text("↗").font(.caption).foregroundStyle(Color.accentColor)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .contentShape(Rectangle())     // the whole line, not just the glyph
-            }
-            .buttonStyle(.plain)
-            .disabled(!model.saved)
-            .help("Open in TextEdit")
-        }
-        .padding(18)
-        .frame(width: 460)
-        .task {
-            await model.refreshRouter()
-            await model.connectIfReady()
-        }
-        .task(id: model.url) {
-            try? await Task.sleep(nanoseconds: 600_000_000)   // debounce typing
-            guard !Task.isCancelled else { return }
-            await model.check()
         }
     }
 }
@@ -763,15 +1166,16 @@ enum Settings {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 580),
                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
             w.title = "micwatch Settings"
-            w.contentView = NSHostingView(rootView: SettingsView())
             w.isReleasedWhenClosed = false
             w.delegate = windowDelegate           // delegate is weak, hence the static
             w.center()
             window = w
         }
-        let content = NSHostingView(rootView: SettingsView())   // fresh, so .task re-runs
-        window?.contentView = content
-        window?.setContentSize(content.fittingSize)             // no dead space at the bottom
+        // Fresh each time, so .task re-runs. preferredContentSize keeps the window
+        // following the view as sections expand and collapse.
+        let controller = NSHostingController(rootView: SettingsView())
+        controller.sizingOptions = .preferredContentSize
+        window?.contentViewController = controller
         NSApp.setActivationPolicy(.regular)       // puts us in the Dock and cmd-tab
         NSApp.activate(ignoringOtherApps: true)
         window?.initialFirstResponder = nil
@@ -1040,7 +1444,7 @@ struct PauseOverlayView: View {
     /// entity id turns "Lounge TV" into "Lounge Tv" and mangles anything with
     /// a model number in it.
     private var displayName: String {
-        if let stored = Config.load()?.entityName, !stored.isEmpty { return stored }
+        if let stored = Config.load()?.displayName, !stored.isEmpty { return stored }
         let derived = player.split(separator: ".").dropFirst().joined(separator: ".")
             .replacingOccurrences(of: "_", with: " ").capitalized
         return derived.isEmpty ? player : derived
@@ -1192,6 +1596,7 @@ final class Watcher: NSObject, NSMenuDelegate {
     private var mediaPaused = false
     private var shownSymbol = ""                // so render can tell a real change
     private var pendingPause: Task<Void, Never>?
+    private var announced = false               // a "started" event went out
 
     // Built once, mutated in place — see buildMenu
     private let statusLine = NSMenuItem()
@@ -1226,23 +1631,32 @@ final class Watcher: NSObject, NSMenuDelegate {
             [weak self] _ in
             self?.rebuild()
             self?.render()
+            self?.tick()                        // the watched-app list may have changed
         }
 
         monitor = MicMonitor { [weak self] in self?.tick() }
         monitor?.start()
+
+        // Watched apps count from launch, so a launch or quit is an event too
+        for name in [NSWorkspace.didLaunchApplicationNotification,
+                     NSWorkspace.didTerminateApplicationNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) {
+                [weak self] _ in self?.tick()
+            }
+        }
 
         // ponytail: 5min backstop, insurance against the listeners going quiet —
         // which is not hypothetical, the process-level ones did exactly that. Also
         // what eventually clears an expired snooze if you never open the menu.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in self.tick() }
 
-        if Config.load()?.entity.isEmpty ?? true { Settings.show() }
+        if Config.load()?.playerList.isEmpty ?? true { Settings.show() }
     }
 
     /// Listeners fire on a background queue, so everything here hops to main.
     func tick() {
         DispatchQueue.main.async {
-            let apps = appsOnMic()
+            let apps = meetingApps()
             if apps != self.current {
                 let wasActive = !self.current.isEmpty
                 self.current = apps
@@ -1256,6 +1670,10 @@ final class Watcher: NSObject, NSMenuDelegate {
                 case (true, false):
                     self.cancelPendingPause()
                     self.music.micActive(false, allowed: true)
+                    if self.announced {         // only close what we opened
+                        self.announced = false
+                        emitEvent(status: "ended", apps: [], mic: false)
+                    }
                 default: break       // mic still held, the app list just changed
                 }
             }
@@ -1275,6 +1693,10 @@ final class Watcher: NSObject, NSMenuDelegate {
             try? await Task.sleep(for: Watcher.pauseDelay)
             guard let self, !Task.isCancelled, !self.current.isEmpty else { return }
             self.music.micActive(true, allowed: self.availability().active)
+            // Same debounce as the pause, so a 100ms mic grab isn't a meeting.
+            // Not gated on snooze or home network: that's the automation's call.
+            self.announced = true
+            emitEvent(status: "started", apps: self.current, mic: !appsOnMic().isEmpty)
         }
     }
 
@@ -1289,7 +1711,7 @@ final class Watcher: NSObject, NSMenuDelegate {
             if until > Date() { return .snoozed(until: until) }
             snoozeUntil = nil                   // expired
         }
-        guard let config = Config.load(), !config.entity.isEmpty, loadToken() != nil else { return .unconfigured }
+        guard let config = Config.load(), !config.playerList.isEmpty, loadToken() != nil else { return .unconfigured }
         if !onHomeNetwork(config) { return .away }
         if reachable == false { return .unreachable(config.url) }
         return current.isEmpty ? .ready : .micInUse(current)
@@ -1366,7 +1788,7 @@ final class Watcher: NSObject, NSMenuDelegate {
         switch state {
         case .micInUse(let apps):
             colour = .systemGreen
-            let player = Config.load().map { $0.entityName ?? $0.entity } ?? ""
+            let player = Config.load()?.displayName ?? ""
             text = mediaPaused ? "Paused \(player)"
                                : "Mic in use by \(apps.joined(separator: ", "))"
         case .ready:
@@ -1494,7 +1916,7 @@ final class Watcher: NSObject, NSMenuDelegate {
     private func showOverlay() {
         guard overlayWorthShowing, let config = Config.load() else { return }
         PauseOverlay.shared.show(
-            player: config.entity,
+            player: config.playerList.first ?? "",    // artwork comes from the first
             apps: current,
             isPaused: mediaPaused,
             actions: .init(
@@ -1620,8 +2042,14 @@ if let i = CommandLine.arguments.firstIndex(of: "--hold") {   // hold the mic, t
     Thread.sleep(forTimeInterval: secs)
     exit(0)
 }
+if CommandLine.arguments.contains("--check") {   // the one non-trivial parser
+    precondition(parseKeyValues("") == nil)
+    precondition(parseKeyValues("room = office\nnokey\n=bad\na=1\na=2\n") == ["room": "office", "a": "2"])
+    precondition(parseKeyValues("url=http://x?y=z") == ["url": "http://x?y=z"])
+    print("PASS"); exit(0)
+}
 if CommandLine.arguments.contains("--once") {
-    let apps = appsOnMic()
+    let apps = meetingApps()
     print(apps.isEmpty ? "idle" : "mic in use: \(apps.joined(separator: ", "))")
     exit(0)
 }

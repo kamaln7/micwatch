@@ -24,7 +24,7 @@ make install    build, sign, and install to /Applications
 ```
 
 Then open **Settings** from the menu bar icon, enter your Home Assistant URL and a
-long-lived access token, and pick a media player. Create the token in Home
+long-lived access token, and tick the media players to pause. Create the token in Home
 Assistant under your profile → Security → Long-lived access tokens; the settings
 window links straight to that page once a URL is entered. **Open at Login** is in
 the same menu.
@@ -73,10 +73,36 @@ loosely. See [RESEARCH.md](RESEARCH.md#home-network-gate).
 The gate covers pausing only, never resuming, so a speaker can't be stranded
 paused if the call ended after you left the house.
 
+## App detection
+
+Some apps only open the microphone once you've actually joined — Zoom takes a few
+seconds after its window is up — so the music plays on into the start of the
+call. On top of watching the mic, Settings has a list of always-on apps that count
+as a meeting **from the moment they launch**, mic or not. Zoom is checked by default; Webex and FaceTime are offered
+unchecked. Anything else goes in the `apps` array of the
+config file as a bundle id, and shows up in the list.
+
+## Home Assistant events
+
+Off by default. When enabled, micwatch fires one event — `micwatch` unless you
+rename it — with a `status` of `started`, `ended` or `test`, plus `apps`, `mic`, `players`,
+`host` and any extra `key=value` pairs you add in Settings. It goes out after the
+same 250ms debounce as the pause, and regardless of the home network gate or a
+disable, so your automations decide what applies where. Home Assistant only lets
+**admin** users fire events over its API, so the token has to come from an admin
+account — the Test button in Settings says so if it's rejected.
+
+```yaml
+trigger:
+  - platform: event
+    event_type: micwatch
+    event_data: { status: started }
+```
+
 ## Configuration
 
-`~/.config/micwatch.json` holds the URL, entity id, display name and home router
-address. Editing it by hand is picked up live, and it's only written when a value
+`~/.config/micwatch.json` holds the URL, entity id, display name, home router
+address, watched apps and event settings. Editing it by hand is picked up live, and it's only written when a value
 actually changed, so an editor holding it open is never told that another
 application modified it.
 
@@ -90,7 +116,7 @@ The build produces one executable, inside the bundle:
 
 ```
 cd /Applications/micwatch.app/Contents/MacOS
-./micwatch --once       idle | mic in use: Slack
+./micwatch --once       idle | mic in use: Slack, Zoom (mic, or a watched app running)
 ./micwatch --ha-state   entity state, plus the home-network gate
 ./micwatch --hold N     hold the mic for N seconds, to test from another shell
 ./micwatch --selftest   opens the mic, asserts the listener path notices
