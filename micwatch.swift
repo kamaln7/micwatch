@@ -15,6 +15,14 @@ import SwiftUI
 
 setvbuf(stdout, nil, _IONBF, 0)
 
+/// `--demo DIR`: run against made-up data and write screenshots into DIR.
+/// Everything that would touch the real config, network or mic is stubbed.
+let demoDir: URL? = CommandLine.arguments.firstIndex(of: "--demo")
+    .map { URL(fileURLWithPath: CommandLine.arguments[$0 + 1]) }
+let demo = demoDir != nil
+let configDir = demoDir ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config")
+let hostName = demo ? "macbook-pro" : ProcessInfo.processInfo.hostName
+
 let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
 func prop(_ sel: AudioObjectPropertySelector,
@@ -133,6 +141,7 @@ func watchedAppsRunning(_ config: Config?) -> [String] {
 
 /// Everything that counts as a meeting right now. Empty = no meeting.
 func meetingApps() -> [String] {
+    if demo { return ["Slack Huddle"] }
     var seen = Set<String>()
     return (appsOnMic() + watchedAppsRunning(Config.load())).filter { seen.insert($0).inserted }
 }
@@ -171,8 +180,7 @@ struct Config: Codable, Equatable {
         return name.isEmpty ? "micwatch" : name
     }
 
-    static let path = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".config/micwatch.json")
+    static let path = configDir.appendingPathComponent("micwatch.json")
 
     static func load() -> Config? {
         guard let data = try? Data(contentsOf: path) else { return nil }
@@ -201,8 +209,7 @@ struct Config: Codable, Equatable {
 /// but not with a self-signed certificate: the item records a cdhash per build,
 /// so every rebuild prompts again. Paying for that protection with a password
 /// prompt on every build, and still not getting it, is the worst of both.
-let tokenPath = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".config/micwatch-token")
+let tokenPath = configDir.appendingPathComponent("micwatch-token")
 
 func loadToken() -> String? {
     if let contents = try? String(contentsOf: tokenPath, encoding: .utf8) {
@@ -307,7 +314,7 @@ func eventPayload(_ config: Config, status: String, apps: [String], mic: Bool) -
     payload["apps"] = apps
     payload["mic"] = mic                    // false when it's only a watched app running
     payload["players"] = config.playerList
-    payload["host"] = ProcessInfo.processInfo.hostName
+    payload["host"] = hostName
     return payload
 }
 
@@ -391,6 +398,7 @@ func shell(_ path: String, _ arguments: [String]) -> String? {
 /// network far more loosely: every café chain reuses the same names. This needs no
 /// permission at all and names your specific hardware.
 func gatewayMAC() -> String? {
+    if demo { return "aa:bb:cc:dd:ee:ff" }
     guard let route = shell("/sbin/route", ["-n", "get", "default"]),
           let line = route.split(separator: "\n").first(where: { $0.contains("gateway:") }) else { return nil }
     let gateway = line.replacingOccurrences(of: "gateway:", with: "").trimmingCharacters(in: .whitespaces)
@@ -428,6 +436,7 @@ final class MusicControl {
     }
 
     private func apply(_ active: Bool, _ allowed: Bool) {
+        if demo { DispatchQueue.main.async { self.onPausedChange?(active) }; return }
         guard let config = Config.load(), !config.playerList.isEmpty, loadToken() != nil else { return }
         if active {
             guard paused.isEmpty, allowed else { return }
@@ -602,6 +611,7 @@ final class SettingsModel: ObservableObject {
     /// free, and runs outside SwiftUI's update pass — publishing from inside one
     /// trips an AttributeGraph precondition and aborts the process.
     func check() async {
+        if demo { reachability = .reachable; return }
         let base = url.trimmingCharacters(in: .whitespaces)
         guard base.hasPrefix("http"), let target = URL(string: base) else {
             reachability = .unknown
@@ -621,6 +631,13 @@ final class SettingsModel: ObservableObject {
     /// Fetches every entity and keeps the media players. Doubles as the auth
     /// check — if the token is wrong this is where you find out, by name.
     func connect() async {
+        if demo {
+            entities = Demo.entities
+            selected = Set(Config.load()?.playerList ?? [])
+            canFireEvents = true
+            status = "Found \(entities.count) media players"
+            return
+        }
         busy = true
         status = ""
         defer { busy = false }
@@ -715,10 +732,10 @@ final class SettingsModel: ObservableObject {
         func q(_ v: String) -> String { "\"" + v.replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
         var rows: [(String, String)] = [
             ("\"status\": \"started\",", "started | ended | test"),
-            ("\"apps\": [\"Zoom\"],", "apps holding the mic, or always-on apps running"),
-            ("\"mic\": true,", "false when only an always-on app is running"),
-            ("\"players\": [\(orderedPlayers.map(q).joined(separator: ", "))],", "the players micwatch pauses"),
-            ("\"host\": \(q(ProcessInfo.processInfo.hostName)),", "this Mac"),
+            ("\"apps\": [\"Zoom\"],", "mic holders or running always-on apps"),
+            ("\"mic\": true,", "false if only an always-on app is running"),
+            ("\"players\": [\(orderedPlayers.map(q).joined(separator: ", "))],", "players micwatch pauses"),
+            ("\"host\": \(q(hostName)),", "this Mac"),
         ]
         rows += (parsedEventData ?? [:]).sorted { $0.key < $1.key }
             .map { ("\(q($0.key)): \(q($0.value)),", "yours, from Extra data") }
@@ -1401,6 +1418,11 @@ final class NowPlaying: ObservableObject {
     @Published var artwork: NSImage?
 
     func load(entity: String) async {
+        if demo {
+            title = "Satisfaction"; artist = "Benny Benassi"
+            artwork = await Demo.artwork()
+            return
+        }
         guard let config = Config.load(), let token = loadToken() else { return }
         guard let (status, data) = await Task.detached(priority: .userInitiated, operation: {
             haRequest("/api/states/\(entity)", base: config.url, token: token)
@@ -2084,9 +2106,57 @@ func installEditMenu() {
     NSApp.mainMenu = main
 }
 
+// MARK: - Demo screenshots
+
+enum Demo {
+    static let entities = [
+        EntityOption(id: "media_player.lounge", name: "Lounge", deviceClass: "speaker", grouped: false, playing: true),
+        EntityOption(id: "media_player.kitchen", name: "Kitchen", deviceClass: "speaker", grouped: false, playing: true),
+        EntityOption(id: "media_player.bedroom", name: "Bedroom", deviceClass: "speaker", grouped: true, playing: false),
+        EntityOption(id: "media_player.office", name: "Office", deviceClass: "speaker", grouped: false, playing: false),
+        EntityOption(id: "media_player.amp", name: "Amp", deviceClass: "receiver", grouped: false, playing: false),
+        EntityOption(id: "media_player.lounge_tv", name: "Lounge TV", deviceClass: "tv", grouped: false, playing: false),
+    ]
+
+    static func writeConfig() {
+        try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        try? Config(url: "http://homeassistant.local:8123", entity: "media_player.lounge",
+                    players: ["media_player.lounge", "media_player.kitchen"],
+                    playerNames: ["media_player.lounge": "Lounge", "media_player.kitchen": "Kitchen"],
+                    homeRouter: "aa:bb:cc:dd:ee:ff", requireHomeNetwork: true,
+                    apps: Config.defaultApps, eventsEnabled: true).save()
+        saveToken("demo")
+    }
+
+    /// Real cover from the iTunes artwork CDN, with a plain gradient if offline.
+    static func artwork() async -> NSImage {
+        let url = URL(string: "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/e8/cb/8e/"
+                      + "e8cb8ef7-d3bf-1d12-7516-57755870d0a6/617465117657.jpg/600x600bb.jpg")!
+        if let (data, _) = try? await URLSession.shared.data(from: url), let image = NSImage(data: data) {
+            return image
+        }
+        return NSImage(size: NSSize(width: 300, height: 300), flipped: false) { rect in
+            NSGradient(colors: [.systemOrange, .systemPurple])?.draw(in: rect, angle: -60)
+            return true
+        }
+    }
+
+    /// Holds the paused card and the settings window on screen, and stays
+    /// running with its own menu bar icon, so screenshots can be taken by hand.
+    /// Quit from that icon's menu.
+    static func run() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {      // card is up and has its art
+            PauseOverlay.shared.keepAlive(true)                    // hold it, as a hovering pointer would
+            Settings.show()
+        }
+    }
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)  // menu bar only, no Dock icon
 installEditMenu()
+if demo { Demo.writeConfig() }
 let watcher = Watcher()
 watcher.start()
+if demo { Demo.run() }
 app.run()
